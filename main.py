@@ -1,5 +1,7 @@
 import os
 import threading
+import urllib.parse
+import urllib.request
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -13,7 +15,6 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 DEFAULT_MODEL = "gemini-3.6-flash"
-IMAGE_MODEL = "gemini-2.5-flash-image"  # a.k.a. "Nano Banana" — free tier, no billing needed
 
 # ---- Arise's default personality ----
 # Edit this to change her behavior everywhere. Individual chats can still
@@ -233,12 +234,11 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
 
     try:
-        response = client.models.generate_content(model=IMAGE_MODEL, contents=[prompt])
-        for part in response.candidates[0].content.parts:
-            if getattr(part, "inline_data", None) is not None:
-                await update.message.reply_photo(photo=part.inline_data.data)
-                return
-        await update.message.reply_text("Didn't get an image back — try rephrasing.")
+        encoded_prompt = urllib.parse.quote(prompt)
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+        with urllib.request.urlopen(url, timeout=60) as response:
+            image_bytes = response.read()
+        await update.message.reply_photo(photo=image_bytes)
     except Exception as e:
         await update.message.reply_text(f"Image generation failed: {e}")
 

@@ -13,7 +13,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 DEFAULT_MODEL = "gemini-3.6-flash"
-IMAGE_MODEL = "imagen-3.0-fast-generate-001"  # a.k.a. "Nano Banana"
+IMAGE_MODEL = "imagen-4.0-fast-generate-001"  # a.k.a. "Nano Banana"
 
 # ---- Arise's default personality ----
 # Edit this to change her behavior everywhere. Individual chats can still

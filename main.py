@@ -165,15 +165,20 @@ async def switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        lines = []
-        for m in client.models.list():
-            lines.append("- " + m.name.replace("models/", ""))
-        text = "Models available on your key:\n" + "\n".join(lines[:30])
-        text += (
-            "\n\nRough guide: 'flash' = fast/everyday, 'flash-lite' = "
-            "fastest and highest free quota, 'pro' = deeper reasoning, "
-            "'flash-image' = image generation."
-        )
+        all_names = [m.name.replace("models/", "") for m in client.models.list()]
+        if context.args:
+            keyword = " ".join(context.args).lower()
+            matches = [n for n in all_names if keyword in n.lower()]
+            if not matches:
+                await update.message.reply_text(f"No models matched '{keyword}'.")
+                return
+            text = f"Models matching '{keyword}':\n" + "\n".join(f"- {n}" for n in matches)
+        else:
+            text = (
+                f"{len(all_names)} models available. Showing first 30 — "
+                "use /models <keyword> to search (e.g. /models image):\n"
+                + "\n".join(f"- {n}" for n in all_names[:30])
+            )
     except Exception as e:
         text = f"Couldn't fetch model list: {e}"
     await update.message.reply_text(text)

@@ -3,20 +3,21 @@ import threading
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # ---- Config ----
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 DEFAULT_MODEL = "gemini-3.6-flash"
-IMAGE_MODEL = "gemini-2.5-flash-image"
+IMAGE_MODEL = "gemini-2.5-flash-image"  # a.k.a. "Nano Banana"
 
 # ---- Arise's default personality ----
-# Edit this text to change how she talks. This is the single biggest lever
-# for her personality.
+# Edit this to change her behavior everywhere. Individual chats can still
+# override it with /persona without touching this default.
 DEFAULT_PERSONA = (
     "You are Arise, a personal AI assistant. Your owner and the person you "
     "talk to is named Virat. You have a warm, mature, feminine personality — "
@@ -27,15 +28,14 @@ DEFAULT_PERSONA = (
     "Keep responses natural and conversational, not robotic."
 )
 
-MAX_TURNS = 20  # turns to keep in full detail per thread before summarizing
+MAX_TURNS = 20  # exchanges to keep in full detail per thread before summarizing
 
 # ---- In-memory state ----
-# Structure per chat_id:
-# {
-#   "threads": { thread_name: {"history": [...], "summary": ""} },
+# user_data[chat_id] = {
+#   "threads": { name: {"history": [...], "summary": "", "persona_override": None} },
 #   "active_thread": "default",
 #   "model": DEFAULT_MODEL,
-#   "persona": DEFAULT_PERSONA,
+#   "global_persona": DEFAULT_PERSONA,
 # }
 user_data = {}
 
@@ -43,16 +43,24 @@ user_data = {}
 def get_user(chat_id):
     if chat_id not in user_data:
         user_data[chat_id] = {
-            "threads": {"default": {"history": [], "summary": ""}},
+            "threads": {"default": {"history": [], "summary": "", "persona_override": None}},
             "active_thread": "default",
             "model": DEFAULT_MODEL,
-            "persona": DEFAULT_PERSONA,
+            "global_persona": DEFAULT_PERSONA,
         }
     return user_data[chat_id]
 
 
-def get_model(model_name, persona):
-    return genai.GenerativeModel(model_name, system_instruction=persona)
+def effective_persona(u, thread):
+    return thread["persona_override"] or u["global_persona"]
+
+
+def build_history(history):
+    contents = []
+    for turn in history:
+        role = turn["role"]
+        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=turn["text"])]))
+    return contents
 
 
 async def summarize_if_needed(chat_id, thread_name):
@@ -68,25 +76,23 @@ async def summarize_if_needed(chat_id, thread_name):
     old_part = history[: len(history) - MAX_TURNS * 2]
     keep_part = history[len(history) - MAX_TURNS * 2:]
 
-    text_to_summarize = ""
+    transcript = ""
     for turn in old_part:
-        role = "Virat" if turn["role"] == "user" else "Arise"
-        text_to_summarize += f"{role}: {turn['parts'][0]}\n"
+        speaker = "Virat" if turn["role"] == "user" else "Arise"
+        transcript += f"{speaker}: {turn['text']}\n"
 
     try:
-        summarizer = genai.GenerativeModel(DEFAULT_MODEL)
         prompt = (
             "Summarize the key facts, context, and preferences from this "
             "conversation in a short paragraph, written so it can be used "
-            "as background memory for future replies:\n\n" + text_to_summarize
+            "as background memory for future replies:\n\n" + transcript
         )
-        result = summarizer.generate_content(prompt)
+        result = client.models.generate_content(model=DEFAULT_MODEL, contents=[prompt])
         new_summary = result.text
     except Exception:
-        new_summary = thread["summary"]  # keep old summary if this fails
+        new_summary = ""
 
-    combined_summary = (thread["summary"] + "\n" + new_summary).strip()
-    thread["summary"] = combined_summary
+    thread["summary"] = (thread["summary"] + "\n" + new_summary).strip()
     thread["history"] = keep_part
 
 
@@ -96,14 +102,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hey, I'm Arise. Just talk to me normally — I'll remember our "
         "conversation as we go.\n\n"
-        "Some things you can do:\n"
+        "Commands:\n"
         "/newchat <name> — start a separate conversation thread\n"
         "/chats — see your threads\n"
         "/switch <name> — switch threads\n"
         "/reset — clear memory in current thread\n"
         "/models — see available AI models\n"
         "/model <name> — switch model\n"
-        "/persona <text> — change how I behave\n"
+        "/persona <text> — change how I behave in THIS chat\n"
+        "/persona reset — undo your changes, back to default for this chat\n"
+        "(Changing /persona while in the 'default' chat changes the base "
+        "personality for every chat that hasn't been customized separately.)\n"
         "/imagine <description> — generate an image"
     )
 
@@ -112,7 +121,8 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     u = get_user(chat_id)
     thread_name = u["active_thread"]
-    u["threads"][thread_name] = {"history": [], "summary": ""}
+    override = u["threads"][thread_name]["persona_override"]
+    u["threads"][thread_name] = {"history": [], "summary": "", "persona_override": override}
     await update.message.reply_text(f"Memory cleared for '{thread_name}'.")
 
 
@@ -123,7 +133,7 @@ async def newchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /newchat study")
         return
     name = " ".join(context.args)
-    u["threads"][name] = {"history": [], "summary": ""}
+    u["threads"][name] = {"history": [], "summary": "", "persona_override": None}
     u["active_thread"] = name
     await update.message.reply_text(f"Started new chat '{name}'. This is now active.")
 
@@ -155,11 +165,15 @@ async def switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        names = []
-        for m in genai.list_models():
-            if "generateContent" in m.supported_generation_methods:
-                names.append(m.name.replace("models/", ""))
-        text = "Available models:\n" + "\n".join(f"- {n}" for n in names[:25])
+        lines = []
+        for m in client.models.list():
+            lines.append("- " + m.name.replace("models/", ""))
+        text = "Models available on your key:\n" + "\n".join(lines[:30])
+        text += (
+            "\n\nRough guide: 'flash' = fast/everyday, 'flash-lite' = "
+            "fastest and highest free quota, 'pro' = deeper reasoning, "
+            "'flash-image' = image generation."
+        )
     except Exception as e:
         text = f"Couldn't fetch model list: {e}"
     await update.message.reply_text(text)
@@ -180,11 +194,30 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     u = get_user(chat_id)
+    thread_name = u["active_thread"]
+    thread = u["threads"][thread_name]
+
     if not context.args:
-        await update.message.reply_text("Usage: /persona <new instructions>")
+        current = effective_persona(u, thread)
+        await update.message.reply_text(f"Current persona for '{thread_name}':\n{current}")
         return
-    u["persona"] = " ".join(context.args)
-    await update.message.reply_text("Got it — updated how I'll behave from now on.")
+
+    if context.args[0].lower() == "reset":
+        if thread_name == "default":
+            u["global_persona"] = DEFAULT_PERSONA
+            await update.message.reply_text("Reset to the default personality (applies everywhere it isn't overridden).")
+        else:
+            thread["persona_override"] = None
+            await update.message.reply_text(f"'{thread_name}' now follows the default personality again.")
+        return
+
+    text = " ".join(context.args)
+    if thread_name == "default":
+        u["global_persona"] = text
+        await update.message.reply_text("Updated the base personality — this applies to every chat that doesn't have its own override.")
+    else:
+        thread["persona_override"] = text
+        await update.message.reply_text(f"Updated persona for '{thread_name}' only. Other chats are unaffected.")
 
 
 async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -192,16 +225,15 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /imagine a cat wearing sunglasses")
         return
     prompt = " ".join(context.args)
-    await update.message.reply_text("Generating your image...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
 
     try:
-        image_model = genai.GenerativeModel(IMAGE_MODEL)
-        response = image_model.generate_content(prompt)
+        response = client.models.generate_content(model=IMAGE_MODEL, contents=[prompt])
         for part in response.candidates[0].content.parts:
             if getattr(part, "inline_data", None) is not None:
                 await update.message.reply_photo(photo=part.inline_data.data)
                 return
-        await update.message.reply_text("Didn't get an image back, try rephrasing.")
+        await update.message.reply_text("Didn't get an image back — try rephrasing.")
     except Exception as e:
         await update.message.reply_text(f"Image generation failed: {e}")
 
@@ -213,25 +245,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_name = u["active_thread"]
     thread = u["threads"][thread_name]
 
-    persona_with_memory = u["persona"]
-    if thread["summary"]:
-        persona_with_memory += (
-            "\n\nBackground memory from earlier in this conversation: "
-            + thread["summary"]
-        )
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    model = get_model(u["model"], persona_with_memory)
+    persona = effective_persona(u, thread)
+    if thread["summary"]:
+        persona += "\n\nBackground memory from earlier in this conversation: " + thread["summary"]
 
     try:
-        chat = model.start_chat(history=thread["history"])
+        chat = client.chats.create(
+            model=u["model"],
+            config=types.GenerateContentConfig(system_instruction=persona),
+            history=build_history(thread["history"]),
+        )
         response = chat.send_message(text)
         reply = response.text
     except Exception as e:
         await update.message.reply_text(f"Something went wrong: {e}")
         return
 
-    thread["history"].append({"role": "user", "parts": [text]})
-    thread["history"].append({"role": "model", "parts": [reply]})
+    thread["history"].append({"role": "user", "text": text})
+    thread["history"].append({"role": "model", "text": reply})
 
     await summarize_if_needed(chat_id, thread_name)
     await update.message.reply_text(reply)
@@ -240,16 +273,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     u = get_user(chat_id)
-    await update.message.reply_text("Looking at your image...")
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     image_bytes = await file.download_as_bytearray()
     caption = update.message.caption or "Describe and analyze this image."
 
     try:
-        model = get_model(u["model"], u["persona"])
-        response = model.generate_content(
-            [{"mime_type": "image/jpeg", "data": bytes(image_bytes)}, caption]
+        response = client.models.generate_content(
+            model=u["model"],
+            contents=[
+                types.Part.from_bytes(data=bytes(image_bytes), mime_type="image/jpeg"),
+                caption,
+            ],
         )
         reply = response.text
     except Exception as e:
@@ -261,7 +297,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     u = get_user(chat_id)
-    await update.message.reply_text("Reading your document...")
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     doc = update.message.document
     file = await context.bot.get_file(doc.file_id)
     file_bytes = await file.download_as_bytearray()
@@ -269,9 +305,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or "Summarize and analyze this document."
 
     try:
-        model = get_model(u["model"], u["persona"])
-        response = model.generate_content(
-            [{"mime_type": mime_type, "data": bytes(file_bytes)}, caption]
+        response = client.models.generate_content(
+            model=u["model"],
+            contents=[
+                types.Part.from_bytes(data=bytes(file_bytes), mime_type=mime_type),
+                caption,
+            ],
         )
         reply = response.text
     except Exception as e:

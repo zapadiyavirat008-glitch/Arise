@@ -236,7 +236,8 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         encoded_prompt = urllib.parse.quote(prompt)
         url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
-        with urllib.request.urlopen(url, timeout=60) as response:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; AriseBot/1.0)"})
+        with urllib.request.urlopen(req, timeout=60) as response:
             image_bytes = response.read()
         await update.message.reply_photo(photo=image_bytes)
     except Exception as e:

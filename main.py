@@ -13,7 +13,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 DEFAULT_MODEL = "gemini-3.6-flash"
-IMAGE_MODEL = "imagen-4.0-fast-generate-001"
+IMAGE_MODEL = "gemini-2.5-flash-image"  # a.k.a. "Nano Banana" — free tier, no billing needed
 
 # ---- Arise's default personality ----
 # Edit this to change her behavior everywhere. Individual chats can still
@@ -228,16 +228,12 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
 
     try:
-        response = client.models.generate_images(
-            model=IMAGE_MODEL,
-            prompt=prompt,
-            config=types.GenerateImagesConfig(number_of_images=1),
-        )
-        if response.generated_images:
-            image_bytes = response.generated_images[0].image.image_bytes
-            await update.message.reply_photo(photo=image_bytes)
-        else:
-            await update.message.reply_text("Didn't get an image back — try rephrasing.")
+        response = client.models.generate_content(model=IMAGE_MODEL, contents=[prompt])
+        for part in response.candidates[0].content.parts:
+            if getattr(part, "inline_data", None) is not None:
+                await update.message.reply_photo(photo=part.inline_data.data)
+                return
+        await update.message.reply_text("Didn't get an image back — try rephrasing.")
     except Exception as e:
         await update.message.reply_text(f"Image generation failed: {e}")
 

@@ -1,4 +1,5 @@
 import os
+import random
 import threading
 import urllib.parse
 import urllib.request
@@ -44,7 +45,16 @@ user_data = {}
 def get_user(chat_id):
     if chat_id not in user_data:
         user_data[chat_id] = {
-            "threads": {"default": {"history": [], "summary": "", "persona_override": None}},
+            "threads": {
+                "default": {
+                    "history": [],
+                    "summary": "",
+                    "persona_override": None,
+                    "auto_image": False,
+                    "msg_count": 0,
+                    "next_image_at": random.randint(3, 5),
+                }
+            },
             "active_thread": "default",
             "model": DEFAULT_MODEL,
             "global_persona": DEFAULT_PERSONA,
@@ -114,7 +124,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/persona reset — undo your changes, back to default for this chat\n"
         "(Changing /persona while in the 'default' chat changes the base "
         "personality for every chat that hasn't been customized separately.)\n"
-        "/imagine <description> — generate an image"
+        "/imagine <description> — generate an image\n"
+        "/autoimage on — in a roleplay chat, I'll occasionally send a scene "
+        "image on my own based on the conversation (this chat only)"
     )
 
 
@@ -134,7 +146,14 @@ async def newchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /newchat study")
         return
     name = " ".join(context.args)
-    u["threads"][name] = {"history": [], "summary": "", "persona_override": None}
+    u["threads"][name] = {
+        "history": [],
+        "summary": "",
+        "persona_override": None,
+        "auto_image": False,
+        "msg_count": 0,
+        "next_image_at": random.randint(3, 5),
+    }
     u["active_thread"] = name
     await update.message.reply_text(f"Started new chat '{name}'. This is now active.")
 
@@ -226,6 +245,14 @@ async def set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Updated persona for '{thread_name}' only. Other chats are unaffected.")
 
 
+async def generate_image_bytes(prompt: str) -> bytes:
+    encoded_prompt = urllib.parse.quote(prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; AriseBot/1.0)"})
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return response.read()
+
+
 async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /imagine a cat wearing sunglasses")
@@ -234,14 +261,59 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
 
     try:
-        encoded_prompt = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; AriseBot/1.0)"})
-        with urllib.request.urlopen(req, timeout=60) as response:
-            image_bytes = response.read()
+        image_bytes = await generate_image_bytes(prompt)
         await update.message.reply_photo(photo=image_bytes)
     except Exception as e:
         await update.message.reply_text(f"Image generation failed: {e}")
+
+
+async def set_autoimage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    u = get_user(chat_id)
+    thread_name = u["active_thread"]
+    thread = u["threads"][thread_name]
+
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        state = "on" if thread["auto_image"] else "off"
+        await update.message.reply_text(f"Auto-image is currently {state} for '{thread_name}'. Usage: /autoimage on")
+        return
+
+    thread["auto_image"] = context.args[0].lower() == "on"
+    thread["msg_count"] = 0
+    thread["next_image_at"] = random.randint(3, 5)
+    state = "on" if thread["auto_image"] else "off"
+    await update.message.reply_text(
+        f"Auto-image turned {state} for '{thread_name}' only. "
+        + ("I'll occasionally send a scene image as we roleplay, based on what's happening." if thread["auto_image"] else "")
+    )
+
+
+async def maybe_send_scene_image(update: Update, chat_id: str, u: dict, thread: dict, user_text: str, reply_text: str):
+    if not thread.get("auto_image"):
+        return
+
+    thread["msg_count"] += 1
+    if thread["msg_count"] < thread["next_image_at"]:
+        return
+
+    thread["msg_count"] = 0
+    thread["next_image_at"] = random.randint(3, 5)
+
+    try:
+        scene_prompt_request = (
+            "Based on this roleplay exchange, write ONE short, vivid visual "
+            "description suitable as an image generation prompt — include the "
+            "setting, the character's appearance, and their current expression "
+            "or pose. Output ONLY the description, nothing else, 1-2 sentences.\n\n"
+            f"User: {user_text}\nCharacter reply: {reply_text}"
+        )
+        scene_result = client.models.generate_content(model=u["model"], contents=[scene_prompt_request])
+        scene_prompt = scene_result.text.strip()
+
+        image_bytes = await generate_image_bytes(scene_prompt)
+        await update.message.reply_photo(photo=image_bytes)
+    except Exception:
+        pass  # silently skip if a scene image fails, don't interrupt the roleplay
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -274,6 +346,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await summarize_if_needed(chat_id, thread_name)
     await update.message.reply_text(reply)
+    await maybe_send_scene_image(update, chat_id, u, thread, text, reply)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,6 +422,7 @@ def main():
     application.add_handler(CommandHandler("model", set_model))
     application.add_handler(CommandHandler("persona", set_persona))
     application.add_handler(CommandHandler("imagine", imagine))
+    application.add_handler(CommandHandler("autoimage", set_autoimage))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

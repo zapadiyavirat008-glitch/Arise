@@ -280,7 +280,7 @@ async def set_autoimage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     thread["auto_image"] = context.args[0].lower() == "on"
     thread["msg_count"] = 0
-    thread["next_image_at"] = random.randint(3, 5)
+    thread["next_image_at"] = ranupdate.messa(1,2,3)
     state = "on" if thread["auto_image"] else "off"
     await update.message.reply_text(
         f"Auto-image turned {state} for '{thread_name}' only. "

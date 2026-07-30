@@ -125,6 +125,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(Changing /persona while in the 'default' chat changes the base "
         "personality for every chat that hasn't been customized separately.)\n"
         "/imagine <description> — generate an image\n"
+        "Send a photo with caption 'edit ...' — I'll edit that photo\n"
         "/autoimage on — in a roleplay chat, I'll occasionally send a scene "
         "image on my own based on the conversation (this chat only)"
     )
@@ -247,7 +248,7 @@ async def set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def generate_image_bytes(prompt: str) -> bytes:
     encoded_prompt = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&model=flux"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; AriseBot/1.0)"})
     with urllib.request.urlopen(req, timeout=60) as response:
         return response.read()
@@ -280,7 +281,7 @@ async def set_autoimage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     thread["auto_image"] = context.args[0].lower() == "on"
     thread["msg_count"] = 0
-    thread["next_image_at"] = ranupdate.messa(1,2,3)
+    thread["next_image_at"] = random.randint(3, 5)
     state = "on" if thread["auto_image"] else "off"
     await update.message.reply_text(
         f"Auto-image turned {state} for '{thread_name}' only. "
@@ -352,18 +353,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     u = get_user(chat_id)
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     image_bytes = await file.download_as_bytearray()
-    caption = update.message.caption or "Describe and analyze this image."
+    caption = update.message.caption or ""
 
+    # Photo editing mode: caption starts with "edit"
+    if caption.lower().startswith("edit"):
+        instruction = caption[4:].strip(" :,-") or "improve this image"
+        await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-image",
+                contents=[
+                    types.Part.from_bytes(data=bytes(image_bytes), mime_type="image/jpeg"),
+                    f"Edit this image: {instruction}",
+                ],
+            )
+            for part in response.candidates[0].content.parts:
+                if getattr(part, "inline_data", None) is not None:
+                    await update.message.reply_photo(photo=part.inline_data.data)
+                    return
+            await update.message.reply_text("Couldn't produce an edited image — try rephrasing the instruction.")
+        except Exception as e:
+            await update.message.reply_text(f"Edit failed: {e}")
+        return
+
+    # Otherwise: normal analysis/description mode
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    analysis_caption = caption or "Describe and analyze this image."
     try:
         response = client.models.generate_content(
             model=u["model"],
             contents=[
                 types.Part.from_bytes(data=bytes(image_bytes), mime_type="image/jpeg"),
-                caption,
+                analysis_caption,
             ],
         )
         reply = response.text
